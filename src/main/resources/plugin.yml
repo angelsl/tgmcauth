@@ -1,0 +1,6 @@
+name: tgmcauth
+version: 1.0
+author: angelsl
+main: io.github.angelsl.tgmcauth.TelegramMinecraftAuth
+api-version: 1.16
+depend: [AuthMe, LuckPerms]

@@ -1,0 +1,200 @@
+package io.github.angelsl.tgmcauth;
+
+import com.pengrad.telegrambot.TelegramBot;
+import com.pengrad.telegrambot.UpdatesListener;
+import com.pengrad.telegrambot.model.Chat;
+import com.pengrad.telegrambot.model.Message;
+import com.pengrad.telegrambot.model.Update;
+import com.pengrad.telegrambot.request.GetMe;
+import com.pengrad.telegrambot.request.SendMessage;
+import com.pengrad.telegrambot.response.GetMeResponse;
+import fr.xephi.authme.api.v3.AuthMeApi;
+import fr.xephi.authme.events.AuthMeAsyncPreLoginEvent;
+import fr.xephi.authme.events.AuthMeAsyncPreRegisterEvent;
+import net.luckperms.api.LuckPerms;
+import net.luckperms.api.node.types.MetaNode;
+import net.luckperms.api.platform.PlayerAdapter;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.plugin.RegisteredServiceProvider;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
+import java.util.logging.Level;
+
+public class TelegramMinecraftAuth extends JavaPlugin implements Listener, UpdatesListener {
+    private static final String META_TELEGRAM_ID = "telegram-id";
+
+    private String botUsername;
+    private TelegramBot bot;
+
+    private LuckPerms luckPerms;
+    private PlayerAdapter<Player> lpAdapter;
+    private FileConfiguration config;
+
+    @Override
+    public void onEnable() {
+        reloadConfig();
+        config = getConfig();
+        config.addDefault("bot_api_key", "please put your Telegram bot API key here.");
+        config.options().copyDefaults(true);
+        saveConfig();
+
+        RegisteredServiceProvider<LuckPerms> provider =
+                Bukkit.getServicesManager().getRegistration(LuckPerms.class);
+        if (provider != null) {
+            luckPerms = provider.getProvider();
+            lpAdapter = luckPerms.getPlayerAdapter(Player.class);
+        } else {
+            getLogger().log(Level.SEVERE, "Could not access LuckPerms");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+
+        String botToken = config.getString("bot_api_key");
+        boolean ok = true;
+        try {
+            bot = new TelegramBot(botToken);
+            GetMeResponse resp = bot.execute(new GetMe());
+            if (!resp.isOk()) {
+                getLogger()
+                        .log(Level.SEVERE, "Error while testing bot API key; is it correct?", resp);
+                ok = false;
+            } else {
+                botUsername = resp.user().username();
+            }
+        } catch (Exception e) {
+            getLogger().log(Level.SEVERE, "Error while testing bot API key; is it correct?", e);
+            ok = false;
+        }
+
+        if (!ok) {
+            bot = null;
+            botUsername = null;
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+
+        bot.setUpdatesListener(this);
+
+        getServer().getPluginManager().registerEvents(this, this);
+    }
+
+    @Override
+    public void onDisable() {
+        getLogger().info("Disabling...");
+        if (bot != null) {
+            bot.removeGetUpdatesListener();
+            bot = null;
+        }
+        getLogger().info("Disabled.");
+    }
+
+
+    @Override
+    public int process(List<Update> updates) {
+        for (Update update : updates) {
+            Message m = update.message();
+            if (m == null || m.text() == null || m.text().isEmpty() || m.chat().type() !=
+                    Chat.Type.Private) {
+                continue;
+            }
+
+            Integer tgId = m.from().id();
+            String[] args = m.text().trim().split("\\s+");
+            if (args.length != 2 || !args[0].equals("/verify")) {
+                bot.execute(new SendMessage(tgId, "Syntax: /verify <username>"));
+                continue;
+            }
+
+            final String tgToMc = "tg_to_mc";
+            ConfigurationSection section = config.getConfigurationSection(tgToMc);
+            if (section == null) {
+                section = config.createSection(tgToMc, Collections.emptyMap());
+            }
+            final String tgIdStr = tgId.toString();
+            final String oldMcUuid = section.getString(tgIdStr);
+            if (oldMcUuid != null) {
+                OfflinePlayer player = Bukkit.getOfflinePlayer(UUID.fromString(oldMcUuid));
+                final String message = player.getName() == null ?
+                        "This Telegram account is already associated with a Minecraft user." :
+                        String.format(
+                                "This Telegram account is already associated with Minecraft user %s.",
+                                player.getName());
+                bot.execute(new SendMessage(tgId, message));
+                continue;
+            }
+
+            Player onlinePlayer = Bukkit.getPlayerExact(args[1]);
+            if (onlinePlayer == null) {
+                bot.execute(new SendMessage(tgId,
+                        "Minecraft user not found. Note: you need to remain online to verify your account."));
+                continue;
+            }
+
+            section.set(tgIdStr, onlinePlayer.getUniqueId().toString());
+            saveConfig();
+            luckPerms.getUserManager().modifyUser(onlinePlayer.getUniqueId(), user -> {
+                user.data()
+                        .add(MetaNode.builder(META_TELEGRAM_ID, tgIdStr).build());
+            });
+
+            bot.execute(new SendMessage(tgId,
+                    "Successful. You may now register or login."));
+        }
+        return CONFIRMED_UPDATES_ALL;
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    private void onJoin(PlayerJoinEvent event) {
+        if (!verified(event.getPlayer())) {
+            boolean isRegistered =
+                    AuthMeApi.getInstance().isRegistered(event.getPlayer().getName());
+            event.getPlayer().sendMessage(
+                    String.format(ChatColor.RED +
+                                    "Please send \"/verify %s\" to @%s on Telegram before %s.",
+                            event.getPlayer().getName(), botUsername,
+                            isRegistered ? "logging in" : "registering"));
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    private void onPreLogin(AuthMeAsyncPreLoginEvent event) {
+        if (!verified(event.getPlayer())) {
+            event.setCanLogin(false);
+            event.getPlayer().sendMessage(
+                    String.format(ChatColor.RED +
+                                    "Please send \"/verify %s\" to @%s on Telegram before logging in.",
+                            event.getPlayer().getName(), botUsername));
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    private void onPreRegister(AuthMeAsyncPreRegisterEvent event) {
+        if (!verified(event.getPlayer())) {
+            event.setCanRegister(false);
+            event.getPlayer().sendMessage(
+                    String.format(ChatColor.RED +
+                                    "Please send \"/verify %s\" to @%s on Telegram before registering.",
+                            event.getPlayer().getName(), botUsername));
+        }
+    }
+
+    private boolean verified(Player p) {
+        return getPlayerTelegramId(p) != null;
+    }
+
+    private String getPlayerTelegramId(Player p) {
+        return lpAdapter.getUser(p).getCachedData().getMetaData().getMetaValue(META_TELEGRAM_ID);
+    }
+}
